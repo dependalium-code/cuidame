@@ -3,7 +3,11 @@ import express from 'express';
 import cors from 'cors';
 import { v4 as uuidv4 } from 'uuid';
 import { getCalendarClient, slotToDateTimes } from './calendar.js';
-import caregivers from './caregivers.json' assert { type: 'json' };
+
+// 👇 Cargar JSON sin "assert": compatible en cualquier Node/Render
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const caregivers = require('./caregivers.json'); // ← ya funciona
 
 const app = express();
 app.use(cors({ origin: true }));
@@ -11,7 +15,7 @@ app.use(express.json());
 
 const RATE = 18, IVA = 0.10;
 
-// Genera tramos horarios
+// Genera tramos horarios (09–14 y 16–20)
 const genRanges = () => {
   const out = [];
   for (let h = 9; h < 14; h++) out.push(`${String(h).padStart(2, '0')}:00-${String(h+1).padStart(2, '0')}:00`);
@@ -43,12 +47,12 @@ app.get('/api/slots', async (req, res) => {
 
     for (const ev of events) {
       const evStart = new Date(ev.start?.dateTime || `${fecha}T00:00:00`);
-      const evEnd = new Date(ev.end?.dateTime || `${fecha}T23:59:59`);
+      const evEnd   = new Date(ev.end?.dateTime   || `${fecha}T23:59:59`);
       for (const r of genRanges()) {
         const [ini, fin] = r.split('-');
         const s = new Date(`${fecha}T${ini}:00`);
         const e = new Date(`${fecha}T${fin}:00`);
-        if (s < evEnd && e > evStart) taken.add(r);
+        if (s < evEnd && e > evStart) taken.add(r); // solapa
       }
     }
 
@@ -61,7 +65,7 @@ app.get('/api/slots', async (req, res) => {
   }
 });
 
-// --- 2) Reservar slots ---
+// --- 2) Reservar: crea eventos en el calendario de la cuidadora ---
 app.post('/api/reserve', async (req, res) => {
   const {
     nombre, apellidos, email, telefono, localidad, direccion,
@@ -83,7 +87,7 @@ app.post('/api/reserve', async (req, res) => {
   try {
     const { calendar } = getCalendarClient();
 
-    // Releer eventos del día
+    // Releer eventos del día para evitar carreras
     const { data } = await calendar.events.list({
       calendarId: cg.calendarId,
       timeMin: new Date(`${fecha}T00:00:00Z`).toISOString(),
@@ -99,13 +103,14 @@ app.post('/api/reserve', async (req, res) => {
       const e = new Date(`${fecha}T${fin}:00`);
       const overlap = existing.some(ev => {
         const a = new Date(ev.start?.dateTime || `${fecha}T00:00:00`);
-        const b = new Date(ev.end?.dateTime || `${fecha}T23:59:59`);
+        const b = new Date(ev.end?.dateTime   || `${fecha}T23:59:59`);
         return s < b && e > a;
       });
       if (overlap) conflicts.push(r);
     }
     if (conflicts.length) return res.status(409).json({ error: 'conflict', slots: conflicts });
 
+    // Crear 1 evento por tramo
     const createdIds = [];
     for (const r of horas) {
       const { start, end } = slotToDateTimes(fecha, r);
@@ -125,7 +130,7 @@ app.post('/api/reserve', async (req, res) => {
           summary: `Reserva — ${r} — ${nombre} ${apellidos}`,
           description: desc,
           start, end,
-          attendees: [{ email }, { email: cg.email }],
+          attendees: [{ email }, { email: cg.email }], // cliente + correo único
           reminders: { useDefault: true }
         }
       });
@@ -141,7 +146,7 @@ app.post('/api/reserve', async (req, res) => {
   }
 });
 
-// --- 3) Cancelar reserva ---
+// --- 3) Cancelar: borra eventos que contengan el token en la descripción ---
 app.get('/api/cancel/:token', async (req, res) => {
   const { token } = req.params;
   try {
@@ -171,7 +176,7 @@ app.get('/api/cancel/:token', async (req, res) => {
     res.send(`<html><body style="font-family:Arial;padding:20px">
       <h2>Reserva anulada correctamente</h2>
       <p>Los huecos quedan disponibles de nuevo.</p>
-      <a href="/">Volver a la web</a>
+      <a href="/">Volver</a>
     </body></html>`);
 
   } catch (e) {
@@ -182,4 +187,3 @@ app.get('/api/cancel/:token', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('API escuchando en', PORT));
-
