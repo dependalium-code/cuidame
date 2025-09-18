@@ -11,26 +11,26 @@ app.use(express.json());
 
 const RATE = 18, IVA = 0.10;
 
+// Genera tramos horarios
 const genRanges = () => {
   const out = [];
-  for (let h=9; h<14; h++) out.push(`${String(h).padStart(2,'0')}:00-${String(h+1).padStart(2,'0')}:00`);
-  for (let h=16; h<20; h++) out.push(`${String(h).padStart(2,'0')}:00-${String(h+1).padStart(2,'0')}:00`);
+  for (let h = 9; h < 14; h++) out.push(`${String(h).padStart(2, '0')}:00-${String(h+1).padStart(2, '0')}:00`);
+  for (let h = 16; h < 20; h++) out.push(`${String(h).padStart(2, '0')}:00-${String(h+1).padStart(2, '0')}:00`);
   return out;
 };
 
-// --- 1) Consultar slots por cuidadora y fecha ---
+// --- 1) Consultar slots ---
 app.get('/api/slots', async (req, res) => {
   const { fecha, cuidadora } = req.query;
-  if(!fecha || !cuidadora) return res.status(400).json({ error: 'fecha y cuidadora son obligatorios' });
+  if (!fecha || !cuidadora) return res.status(400).json({ error: 'fecha y cuidadora requeridas' });
   const cg = caregivers[cuidadora];
-  if(!cg) return res.status(404).json({ error: 'cuidadora no encontrada' });
+  if (!cg) return res.status(404).json({ error: 'cuidadora no encontrada' });
 
   try {
     const { calendar, TZ } = getCalendarClient();
 
-    // Trae eventos del día
-    const timeMin = new Date(`${fecha}T00:00:00.000Z`).toISOString();
-    const timeMax = new Date(`${fecha}T23:59:59.999Z`).toISOString();
+    const timeMin = new Date(`${fecha}T00:00:00Z`).toISOString();
+    const timeMax = new Date(`${fecha}T23:59:59Z`).toISOString();
 
     const { data } = await calendar.events.list({
       calendarId: cg.calendarId,
@@ -41,11 +41,10 @@ app.get('/api/slots', async (req, res) => {
     const events = data.items || [];
     const taken = new Set();
 
-    // Señalamos como ocupado cualquier tramo que solape con un evento
-    for(const ev of events){
+    for (const ev of events) {
       const evStart = new Date(ev.start?.dateTime || `${fecha}T00:00:00`);
-      const evEnd   = new Date(ev.end?.dateTime   || `${fecha}T23:59:59`);
-      for(const r of genRanges()){
+      const evEnd = new Date(ev.end?.dateTime || `${fecha}T23:59:59`);
+      for (const r of genRanges()) {
         const [ini, fin] = r.split('-');
         const s = new Date(`${fecha}T${ini}:00`);
         const e = new Date(`${fecha}T${fin}:00`);
@@ -62,7 +61,7 @@ app.get('/api/slots', async (req, res) => {
   }
 });
 
-// --- 2) Reservar: crea eventos + devuelve enlace de cancelación ---
+// --- 2) Reservar slots ---
 app.post('/api/reserve', async (req, res) => {
   const {
     nombre, apellidos, email, telefono, localidad, direccion,
@@ -70,46 +69,45 @@ app.post('/api/reserve', async (req, res) => {
   } = req.body || {};
 
   if (!nombre || !apellidos || !email || !telefono || !localidad || !direccion
-    || !Array.isArray(servicios) || servicios.length===0
-    || !cuidadora || !fecha || !Array.isArray(horas) || horas.length===0) {
+    || !Array.isArray(servicios) || servicios.length === 0
+    || !cuidadora || !fecha || !Array.isArray(horas) || horas.length === 0) {
     return res.status(400).json({ error: 'missing_fields' });
   }
 
   const cg = caregivers[cuidadora];
-  if(!cg) return res.status(404).json({ error: 'cuidadora_not_found' });
+  if (!cg) return res.status(404).json({ error: 'cuidadora_not_found' });
 
   const subtotal = horas.length * RATE, iva = subtotal * IVA, total = subtotal + iva;
-  const token = uuidv4(); // para cancelar sin BD
+  const token = uuidv4();
 
   try {
     const { calendar } = getCalendarClient();
 
-    // Comprobación rápida de conflictos (vuelve a leer calendario)
+    // Releer eventos del día
     const { data } = await calendar.events.list({
       calendarId: cg.calendarId,
-      timeMin: new Date(`${fecha}T00:00:00.000Z`).toISOString(),
-      timeMax: new Date(`${fecha}T23:59:59.999Z`).toISOString(),
+      timeMin: new Date(`${fecha}T00:00:00Z`).toISOString(),
+      timeMax: new Date(`${fecha}T23:59:59Z`).toISOString(),
       singleEvents: true, orderBy: 'startTime'
     });
     const existing = data.items || [];
 
     const conflicts = [];
-    for(const r of horas){
+    for (const r of horas) {
       const [ini, fin] = r.split('-');
       const s = new Date(`${fecha}T${ini}:00`);
       const e = new Date(`${fecha}T${fin}:00`);
-      const overlap = existing.some(ev=>{
+      const overlap = existing.some(ev => {
         const a = new Date(ev.start?.dateTime || `${fecha}T00:00:00`);
-        const b = new Date(ev.end?.dateTime   || `${fecha}T23:59:59`);
+        const b = new Date(ev.end?.dateTime || `${fecha}T23:59:59`);
         return s < b && e > a;
       });
-      if(overlap) conflicts.push(r);
+      if (overlap) conflicts.push(r);
     }
-    if(conflicts.length) return res.status(409).json({ error: 'conflict', slots: conflicts });
+    if (conflicts.length) return res.status(409).json({ error: 'conflict', slots: conflicts });
 
-    // Crear 1 evento por tramo (más robusto para bloquear)
     const createdIds = [];
-    for(const r of horas){
+    for (const r of horas) {
       const { start, end } = slotToDateTimes(fecha, r);
       const desc = [
         `Cliente: ${nombre} ${apellidos}`,
@@ -127,7 +125,7 @@ app.post('/api/reserve', async (req, res) => {
           summary: `Reserva — ${r} — ${nombre} ${apellidos}`,
           description: desc,
           start, end,
-          attendees: [{ email }, { email: cg.email }], // invita a cliente y cuidadora
+          attendees: [{ email }, { email: cg.email }],
           reminders: { useDefault: true }
         }
       });
@@ -143,21 +141,18 @@ app.post('/api/reserve', async (req, res) => {
   }
 });
 
-// --- 3) Cancelar: busca el token y borra eventos en TODOS los calendarios ---
+// --- 3) Cancelar reserva ---
 app.get('/api/cancel/:token', async (req, res) => {
   const { token } = req.params;
   try {
     const { calendar } = getCalendarClient();
-
-    // Buscamos por texto (q) en todos los calendarios de cuidadoras
     const ids = Object.values(caregivers).map(c => c.calendarId);
     let deleted = 0;
 
-    for(const calendarId of ids){
-      // Nota: limitamos el rango de búsqueda a +/- 1 año
+    for (const calendarId of ids) {
       const now = new Date();
-      const past = new Date(now); past.setFullYear(now.getFullYear()-1);
-      const future = new Date(now); future.setFullYear(now.getFullYear()+1);
+      const past = new Date(now); past.setFullYear(now.getFullYear() - 1);
+      const future = new Date(now); future.setFullYear(now.getFullYear() + 1);
 
       const { data } = await calendar.events.list({
         calendarId, q: token,
@@ -165,12 +160,13 @@ app.get('/api/cancel/:token', async (req, res) => {
         timeMax: future.toISOString(),
         singleEvents: true
       });
-      for(const ev of (data.items||[])){
-        try { await calendar.events.delete({ calendarId, eventId: ev.id }); deleted++; } catch(_){}
+
+      for (const ev of (data.items || [])) {
+        try { await calendar.events.delete({ calendarId, eventId: ev.id }); deleted++; } catch(_) {}
       }
     }
 
-    if(!deleted) return res.status(404).send('No se encontró ninguna reserva con ese token.');
+    if (!deleted) return res.status(404).send('No se encontró ninguna reserva con ese token.');
 
     res.send(`<html><body style="font-family:Arial;padding:20px">
       <h2>Reserva anulada correctamente</h2>
@@ -186,3 +182,4 @@ app.get('/api/cancel/:token', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('API escuchando en', PORT));
+
