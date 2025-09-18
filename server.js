@@ -11,13 +11,14 @@ const PORT = process.env.PORT || 10000;
 app.use(cors());
 app.use(bodyParser.json());
 
-// ===== Config =====
+// ======== CONFIG ========
 const keyFile = process.env.GOOGLE_APPLICATION_CREDENTIALS || '/etc/secrets/gsa.json';
 if (!fs.existsSync(keyFile)) {
   console.error('⚠️ No se encuentra el fichero de credenciales:', keyFile);
 }
 const TZ = 'Europe/Madrid';
 
+// Calendarios por cuidadora (tus IDs)
 const CAREGIVERS = {
   Raquel: {
     calendarId:
@@ -36,7 +37,7 @@ const CAREGIVERS = {
   },
 };
 
-// Todas las franjas laborales
+// Todas las franjas laborales (incluye 13:00–14:00)
 const RANGES = [
   '09:00-10:00',
   '10:00-11:00',
@@ -48,7 +49,7 @@ const RANGES = [
   '19:00-20:00',
 ];
 
-// ===== Helpers =====
+// ======== HELPERS ========
 function getGoogleClient() {
   return new google.auth.GoogleAuth({
     keyFilename: keyFile,
@@ -75,20 +76,21 @@ function ensureMinWorkdays(dateStr, n = 5) {
   const today = new Date();
   const min = addWorkdays(today, n);
   const sel = new Date(dateStr + 'T00:00:00');
-  return sel >= new Date(min.getFullYear(), min.getMonth(), min.getDate());
+  const normalizedMin = new Date(min.getFullYear(), min.getMonth(), min.getDate());
+  return sel >= normalizedMin;
 }
 
 function toRFC3339(dateStr, range) {
   const [h1, m1] = range.split('-')[0].split(':').map(Number);
   const [h2, m2] = range.split('-')[1].split(':').map(Number);
-  const start = new Date(`${dateStr}T${String(h1).padStart(2, '0')}:${String(m1).padStart(2, '0')}:00`);
-  const end = new Date(`${dateStr}T${String(h2).padStart(2, '0')}:${String(m2).padStart(2, '0')}:00`);
-  return { start: start.toISOString(), end: end.toISOString() };
+  const s = new Date(`${dateStr}T${String(h1).padStart(2,'0')}:${String(m1).padStart(2,'0')}:00`);
+  const e = new Date(`${dateStr}T${String(h2).padStart(2,'0')}:${String(m2).padStart(2,'0')}:00`);
+  return { start: s.toISOString(), end: e.toISOString() };
 }
 
 async function listDayEvents(calendar, calendarId, dateStr) {
   const startOfDay = new Date(dateStr + 'T00:00:00');
-  const endOfDay = new Date(dateStr + 'T23:59:59');
+  const endOfDay   = new Date(dateStr + 'T23:59:59');
   const resp = await calendar.events.list({
     calendarId,
     singleEvents: true,
@@ -100,15 +102,17 @@ async function listDayEvents(calendar, calendarId, dateStr) {
   return resp.data.items || [];
 }
 
-// ===== Rutas =====
+// ======== RUTAS ========
 app.get('/', (_req, res) => res.send('Cuidame API • OK'));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
-// Slots disponibles
+// Obtener slots disponibles
 app.get('/api/slots', async (req, res) => {
   try {
     const { fecha, cuidadora } = req.query;
     if (!fecha || !cuidadora) return res.status(400).json({ error: 'missing_params' });
+
+    // Fines de semana siempre bloqueados
     if (isWeekend(fecha)) return res.json({ slots: RANGES.map(r => ({ range: r, taken: true })) });
 
     const cfg = CAREGIVERS[cuidadora];
@@ -121,7 +125,7 @@ app.get('/api/slots', async (req, res) => {
     const taken = new Set();
     for (const ev of events) {
       const start = new Date(ev.start.dateTime || ev.start.date);
-      const end = new Date(ev.end.dateTime || ev.end.date);
+      const end   = new Date(ev.end.dateTime   || ev.end.date);
       for (const r of RANGES) {
         const { start: rs, end: re } = toRFC3339(fecha, r);
         const rStart = new Date(rs), rEnd = new Date(re);
@@ -137,16 +141,20 @@ app.get('/api/slots', async (req, res) => {
   }
 });
 
-// Reservar
+// Reservar (crea eventos sin attendees para evitar 403)
 app.post('/api/reservar', async (req, res) => {
   try {
-    const { nombre, apellidos, email, telefono, localidad, direccion, servicios = [], cuidadora, fecha, horas = [], detalles = '' } = req.body || {};
+    const {
+      nombre, apellidos, email, telefono,
+      localidad, direccion, servicios = [],
+      cuidadora, fecha, horas = [], detalles = ''
+    } = req.body || {};
 
     if (!nombre || !apellidos || !email || !telefono || !localidad || !direccion || !cuidadora || !fecha)
       return res.status(400).json({ error: 'faltan_campos' });
     if (servicios.length === 0) return res.status(400).json({ error: 'faltan_servicios' });
-    if (horas.length === 0) return res.status(400).json({ error: 'faltan_horas' });
-    if (isWeekend(fecha)) return res.status(400).json({ error: 'weekend_not_allowed' });
+    if (horas.length === 0)     return res.status(400).json({ error: 'faltan_horas' });
+    if (isWeekend(fecha))       return res.status(400).json({ error: 'weekend_not_allowed' });
     if (!ensureMinWorkdays(fecha, 5)) return res.status(400).json({ error: 'min_workdays_not_met' });
 
     const cfg = CAREGIVERS[cuidadora];
@@ -155,12 +163,12 @@ app.post('/api/reservar', async (req, res) => {
     const auth = getGoogleClient();
     const calendar = google.calendar({ version: 'v3', auth });
 
-    // Conflictos
+    // Comprobar conflictos
     const events = await listDayEvents(calendar, cfg.calendarId, fecha);
     const occupied = new Set();
     for (const ev of events) {
       const start = new Date(ev.start.dateTime || ev.start.date);
-      const end = new Date(ev.end.dateTime || ev.end.date);
+      const end   = new Date(ev.end.dateTime   || ev.end.date);
       for (const r of horas) {
         const { start: rs, end: re } = toRFC3339(fecha, r);
         const rStart = new Date(rs), rEnd = new Date(re);
@@ -169,36 +177,45 @@ app.post('/api/reservar', async (req, res) => {
     }
     if (occupied.size) return res.status(409).json({ error: 'conflict', slots: [...occupied] });
 
-    // Crear eventos
+    // Crear eventos (sin attendees -> evita el 403)
     const created = [];
     for (const r of horas) {
       const { start, end } = toRFC3339(fecha, r);
       const summary = `CUIDAME — ${nombre} ${apellidos} — ${r}`;
       const description =
-        `Tel: ${telefono}\nEmail: ${email}\nLocalidad: ${localidad}\nDirección: ${direccion}\nServicios: ${servicios.join(', ')}\n${detalles ? 'Detalles: ' + detalles : ''}`;
+`Tel: ${telefono}
+Email: ${email}
+Localidad: ${localidad}
+Dirección: ${direccion}
+Servicios: ${servicios.join(', ')}
+Cuidadora: ${cuidadora}
+Origen: web-hero-overlay${detalles ? '\nDetalles: ' + detalles : ''}`;
 
       const ev = await calendar.events.insert({
         calendarId: cfg.calendarId,
+        sendUpdates: 'none', // <- clave para no intentar invitar
         requestBody: {
           start: { dateTime: start, timeZone: TZ },
-          end: { dateTime: end, timeZone: TZ },
+          end:   { dateTime: end,   timeZone: TZ },
           summary,
           description,
-          attendees: [{ email: cfg.email }, { email }],
+          guestsCanInviteOthers: false,
+          guestsCanModify: false,
+          guestsCanSeeOtherGuests: false,
+          extendedProperties: { private: { cuidame: '1', range: r } },
         },
-        sendUpdates: 'all',
       });
       created.push(ev.data.id);
     }
 
-    res.json({ ok: true, created: created.length, eventIds: created });
+    res.json({ ok: true, created: created.length, eventIds: created, bloques: horas });
   } catch (err) {
     console.error('RESERVAR ERROR:', err);
     res.status(500).json({ error: 'server_error', details: err.message });
   }
 });
 
-// Cancelar
+// Cancelar (borra del calendario -> vuelve a quedar libre)
 app.post('/api/cancel', async (req, res) => {
   try {
     const { cuidadora, eventIds = [] } = req.body || {};
@@ -209,8 +226,13 @@ app.post('/api/cancel', async (req, res) => {
 
     const auth = getGoogleClient();
     const calendar = google.calendar({ version: 'v3', auth });
+
     for (const id of eventIds) {
-      await calendar.events.delete({ calendarId: cfg.calendarId, eventId: id, sendUpdates: 'all' });
+      await calendar.events.delete({
+        calendarId: cfg.calendarId,
+        eventId: id,
+        sendUpdates: 'none',
+      });
     }
     res.json({ ok: true, deleted: eventIds.length });
   } catch (err) {
