@@ -1,161 +1,235 @@
-// server.js
+/**
+ * Cuidame — API de reservas (Google Calendar)
+ * Node 22.x — Express
+ *
+ * Requisitos en Render:
+ * 1) Variable de entorno: GOOGLE_APPLICATION_CREDENTIALS=/etc/secrets/gsa.json
+ * 2) Secret file: gsa.json (credenciales de la cuenta de servicio)
+ * 3) Build & Start: node server.js
+ */
+
 import express from 'express';
 import cors from 'cors';
-import bodyParser from 'body-parser';
 import { google } from 'googleapis';
-import fs from 'fs';
 
 const app = express();
-const PORT = process.env.PORT || 10000;
-
 app.use(cors());
-app.use(bodyParser.json());
+app.use(express.json());
 
-// ======== CONFIG ========
-const keyFile = process.env.GOOGLE_APPLICATION_CREDENTIALS || '/etc/secrets/gsa.json';
-if (!fs.existsSync(keyFile)) {
-  console.error('⚠️ No se encuentra el fichero de credenciales:', keyFile);
-}
-const TZ = 'Europe/Madrid';
+/* ========= CONFIG ========= */
 
-// Calendarios por cuidadora (tus IDs)
+/** Mapa de cuidadoras → sus calendarios (IDs correctos que nos pasaste) */
 const CAREGIVERS = {
-  Raquel: {
+  Carmen: {
     calendarId:
       '4562295563647999c8222fc750cf01803405063f186574ff7df5dfe2694a9c73@group.calendar.google.com',
     email: 'dependalium@gmail.com',
   },
-  Carmen: {
+  Daniela: {
     calendarId:
       '84f168dd91cb85bbe4a97b2c88d4d174a3b09f53e025b0a51f401dc91cf70759@group.calendar.google.com',
     email: 'dependalium@gmail.com',
   },
-  Daniela: {
+  Raquel: {
     calendarId:
       'fe9a8085d8db29f888a6382935c82e20f33d476347adfe6416582401d377454d@group.calendar.google.com',
     email: 'dependalium@gmail.com',
   },
 };
 
-// Todas las franjas laborales (incluye 13:00–14:00)
+/** Zona horaria oficial — evita desfases */
+const TZ = 'Europe/Madrid';
+
+/** Rangos de horas: 09–13 y 16–20 (incluye 13–14, que te faltaba) */
 const RANGES = [
   '09:00-10:00',
   '10:00-11:00',
   '11:00-12:00',
   '12:00-13:00',
   '13:00-14:00',
+  '16:00-17:00',
   '17:00-18:00',
   '18:00-19:00',
   '19:00-20:00',
 ];
 
-// ======== HELPERS ========
+/** +5 días laborables bloqueados desde HOY */
+const BLOCK_WORKDAYS = 5;
+
+/* ========= HELPERS ========= */
+
+/** ¿Fin de semana? (0=Dom, 6=Sáb) */
+function isWeekend(dateStr) {
+  const d = new Date(dateStr + 'T00:00:00');
+  const wd = d.getDay();
+  return wd === 0 || wd === 6;
+}
+
+/** Suma n días naturales */
+function addDays(d, n) {
+  const x = new Date(d);
+  x.setDate(x.getDate() + n);
+  return x;
+}
+
+/** Suma n días laborables a partir de 'today' (sin contar sábados ni domingos) */
+function addWorkdaysFromToday(n) {
+  const x = new Date();
+  let count = 0;
+  while (count < n) {
+    x.setDate(x.getDate() + 1);
+    const wd = x.getDay();
+    if (wd !== 0 && wd !== 6) count++;
+  }
+  // devuelve yyyy-mm-dd
+  const pad = (k) => String(k).padStart(2, '0');
+  return `${x.getFullYear()}-${pad(x.getMonth() + 1)}-${pad(x.getDate())}`;
+}
+
+/** Da formato local “yyyy-mm-ddTHH:MM:SS” SIN offset ni Z (lo interpreta con timeZone) */
+function toLocalDateTime(dateStr, hh, mm = 0) {
+  const pad = (k) => String(k).padStart(2, '0');
+  return `${dateStr}T${pad(hh)}:${pad(mm)}:00`;
+}
+
+/** Parsea "HH:MM-HH:MM" a objetos { dateTime, timeZone } **locales** */
+function toGCalTimes(dateStr, range) {
+  const [a, b] = range.split('-'); // "13:00" , "14:00"
+  const [h1, m1] = a.split(':').map((n) => parseInt(n, 10));
+  const [h2, m2] = b.split(':').map((n) => parseInt(n, 10));
+  return {
+    start: { dateTime: toLocalDateTime(dateStr, h1, m1), timeZone: TZ },
+    end: { dateTime: toLocalDateTime(dateStr, h2, m2), timeZone: TZ },
+  };
+}
+
+/** Auth de Google (usa GOOGLE_APPLICATION_CREDENTIALS) */
 function getGoogleClient() {
   return new google.auth.GoogleAuth({
-    keyFilename: keyFile,
     scopes: ['https://www.googleapis.com/auth/calendar'],
   });
 }
 
-function isWeekend(dateStr) {
-  const d = new Date(dateStr + 'T00:00:00');
-  return d.getDay() === 0 || d.getDay() === 6;
-}
-
-function addWorkdays(from, n) {
-  const x = new Date(from);
-  let c = 0;
-  while (c < n) {
-    x.setDate(x.getDate() + 1);
-    if (![0, 6].includes(x.getDay())) c++;
-  }
-  return x;
-}
-
-function ensureMinWorkdays(dateStr, n = 5) {
-  const today = new Date();
-  const min = addWorkdays(today, n);
-  const sel = new Date(dateStr + 'T00:00:00');
-  const normalizedMin = new Date(min.getFullYear(), min.getMonth(), min.getDate());
-  return sel >= normalizedMin;
-}
-
-function toRFC3339(dateStr, range) {
-  const [h1, m1] = range.split('-')[0].split(':').map(Number);
-  const [h2, m2] = range.split('-')[1].split(':').map(Number);
-  const s = new Date(`${dateStr}T${String(h1).padStart(2,'0')}:${String(m1).padStart(2,'0')}:00`);
-  const e = new Date(`${dateStr}T${String(h2).padStart(2,'0')}:${String(m2).padStart(2,'0')}:00`);
-  return { start: s.toISOString(), end: e.toISOString() };
-}
-
+/** Lista los eventos de un día (00:00–23:59) del calendario */
 async function listDayEvents(calendar, calendarId, dateStr) {
-  const startOfDay = new Date(dateStr + 'T00:00:00');
-  const endOfDay   = new Date(dateStr + 'T23:59:59');
+  const startOfDay = `${dateStr}T00:00:00`;
+  const endOfDay = `${dateStr}T23:59:59`;
   const resp = await calendar.events.list({
     calendarId,
+    timeMin: startOfDay,
+    timeMax: endOfDay,
+    timeZone: TZ,
     singleEvents: true,
     orderBy: 'startTime',
-    timeMin: startOfDay.toISOString(),
-    timeMax: endOfDay.toISOString(),
-    timeZone: TZ,
   });
   return resp.data.items || [];
 }
 
-// ======== RUTAS ========
-app.get('/', (_req, res) => res.send('Cuidame API • OK'));
-app.get('/api/health', (_req, res) => res.json({ ok: true }));
+/* ========= ENDPOINTS ========= */
 
-// Obtener slots disponibles
+app.get('/api/health', (req, res) => res.send('OK'));
+
+/**
+ * GET /api/slots?fecha=YYYY-MM-DD&cuidadora=Nombre
+ * Responde con cada rango "taken" o no tomado
+ * Bloquea fines de semana y también los primeros +5 laborables desde HOY
+ */
 app.get('/api/slots', async (req, res) => {
   try {
     const { fecha, cuidadora } = req.query;
-    if (!fecha || !cuidadora) return res.status(400).json({ error: 'missing_params' });
+    if (!fecha || !cuidadora)
+      return res.status(400).json({ error: 'missing_params' });
 
-    // Fines de semana siempre bloqueados
-    if (isWeekend(fecha)) return res.json({ slots: RANGES.map(r => ({ range: r, taken: true })) });
+    // bloqueos
+    if (isWeekend(fecha)) {
+      return res.json({
+        slots: RANGES.map((r) => ({ range: r, taken: true })),
+        reason: 'weekend',
+      });
+    }
+
+    // +5 laborables bloqueados desde HOY
+    const minAllowed = addWorkdaysFromToday(BLOCK_WORKDAYS); // yyyy-mm-dd
+    if (fecha < minAllowed) {
+      return res.json({
+        slots: RANGES.map((r) => ({ range: r, taken: true })),
+        reason: 'blocked_window',
+        minAllowed,
+      });
+    }
 
     const cfg = CAREGIVERS[cuidadora];
     if (!cfg) return res.status(404).json({ error: 'caregiver_not_found' });
 
     const auth = getGoogleClient();
     const calendar = google.calendar({ version: 'v3', auth });
+
     const events = await listDayEvents(calendar, cfg.calendarId, fecha);
 
+    // marca tomados
     const taken = new Set();
     for (const ev of events) {
-      const start = new Date(ev.start.dateTime || ev.start.date);
-      const end   = new Date(ev.end.dateTime   || ev.end.date);
+      const evStart = new Date(ev.start.dateTime || ev.start.date);
+      const evEnd = new Date(ev.end.dateTime || ev.end.date);
       for (const r of RANGES) {
-        const { start: rs, end: re } = toRFC3339(fecha, r);
-        const rStart = new Date(rs), rEnd = new Date(re);
-        if (rStart < end && rEnd > start) taken.add(r);
+        const { start, end } = toGCalTimes(fecha, r);
+        const rStart = new Date(start.dateTime);
+        const rEnd = new Date(end.dateTime);
+        // solape
+        if (rStart < evEnd && rEnd > evStart) taken.add(r);
       }
     }
 
-    const out = RANGES.map(r => ({ range: r, taken: taken.has(r) }));
+    const out = RANGES.map((r) => ({ range: r, taken: taken.has(r) }));
     res.json({ slots: out });
   } catch (err) {
-    console.error('SLOTS ERROR:', err);
-    res.status(500).json({ error: 'server_error', details: err.message });
+    console.error('❌ SLOTS ERROR:', err.response?.data || err.message);
+    res.status(500).json({ error: 'server_error' });
   }
 });
 
-// Reservar (crea eventos sin attendees para evitar 403)
-app.post('/api/reservar', async (req, res) => {
+/**
+ * POST /api/reserve
+ * body: { nombre, apellidos, email, telefono, localidad, direccion, servicios[], cuidadora, fecha, horas[] }
+ * Crea UN evento por cada hora solicitada (y no invita asistentes para evitar 403).
+ */
+app.post('/api/reserve', async (req, res) => {
   try {
     const {
-      nombre, apellidos, email, telefono,
-      localidad, direccion, servicios = [],
-      cuidadora, fecha, horas = [], detalles = ''
+      nombre,
+      apellidos,
+      email,
+      telefono,
+      localidad,
+      direccion,
+      servicios = [],
+      cuidadora,
+      fecha,
+      horas = [],
+      origen = 'web-hero-overlay',
+      detalles = '',
     } = req.body || {};
 
-    if (!nombre || !apellidos || !email || !telefono || !localidad || !direccion || !cuidadora || !fecha)
-      return res.status(400).json({ error: 'faltan_campos' });
-    if (servicios.length === 0) return res.status(400).json({ error: 'faltan_servicios' });
-    if (horas.length === 0)     return res.status(400).json({ error: 'faltan_horas' });
-    if (isWeekend(fecha))       return res.status(400).json({ error: 'weekend_not_allowed' });
-    if (!ensureMinWorkdays(fecha, 5)) return res.status(400).json({ error: 'min_workdays_not_met' });
+    if (
+      !nombre ||
+      !apellidos ||
+      !email ||
+      !telefono ||
+      !localidad ||
+      !direccion ||
+      !cuidadora ||
+      !fecha ||
+      !Array.isArray(horas) ||
+      horas.length === 0
+    ) {
+      return res.status(400).json({ error: 'missing_required_fields' });
+    }
+
+    // bloqueos
+    if (isWeekend(fecha)) return res.status(400).json({ error: 'weekend' });
+    const minAllowed = addWorkdaysFromToday(BLOCK_WORKDAYS);
+    if (fecha < minAllowed)
+      return res.status(400).json({ error: 'blocked_window', minAllowed });
 
     const cfg = CAREGIVERS[cuidadora];
     if (!cfg) return res.status(404).json({ error: 'caregiver_not_found' });
@@ -163,82 +237,66 @@ app.post('/api/reservar', async (req, res) => {
     const auth = getGoogleClient();
     const calendar = google.calendar({ version: 'v3', auth });
 
-    // Comprobar conflictos
+    // 1) Comprobar que no haya solapes ahora mismo
     const events = await listDayEvents(calendar, cfg.calendarId, fecha);
-    const occupied = new Set();
+    const taken = new Set();
     for (const ev of events) {
-      const start = new Date(ev.start.dateTime || ev.start.date);
-      const end   = new Date(ev.end.dateTime   || ev.end.date);
+      const evStart = new Date(ev.start.dateTime || ev.start.date);
+      const evEnd = new Date(ev.end.dateTime || ev.end.date);
       for (const r of horas) {
-        const { start: rs, end: re } = toRFC3339(fecha, r);
-        const rStart = new Date(rs), rEnd = new Date(re);
-        if (rStart < end && rEnd > start) occupied.add(r);
+        const { start, end } = toGCalTimes(fecha, r);
+        const rStart = new Date(start.dateTime);
+        const rEnd = new Date(end.dateTime);
+        if (rStart < evEnd && rEnd > evStart) taken.add(r);
       }
     }
-    if (occupied.size) return res.status(409).json({ error: 'conflict', slots: [...occupied] });
+    if (taken.size > 0)
+      return res.status(409).json({ error: 'conflict', slots: [...taken] });
 
-    // Crear eventos (sin attendees -> evita el 403)
+    // 2) Crear cada evento (sin attendees, sin sendUpdates)
     const created = [];
-    for (const r of horas) {
-      const { start, end } = toRFC3339(fecha, r);
-      const summary = `CUIDAME — ${nombre} ${apellidos} — ${r}`;
-      const description =
-`Tel: ${telefono}
-Email: ${email}
-Localidad: ${localidad}
-Dirección: ${direccion}
-Servicios: ${servicios.join(', ')}
-Cuidadora: ${cuidadora}
-Origen: web-hero-overlay${detalles ? '\nDetalles: ' + detalles : ''}`;
+    for (const range of horas) {
+      const { start, end } = toGCalTimes(fecha, range);
+      const event = {
+        start,
+        end,
+        summary: `CUIDAME — ${nombre} ${apellidos} — ${range}`,
+        description:
+          `Tel: ${telefono}\nEmail: ${email}\nLocalidad: ${localidad}\nDirección: ${direccion}\n` +
+          `Servicios: ${servicios.join(', ') || '-'}\nCuidadora: ${cuidadora}\nOrigen: ${origen}\n${detalles ? `\nDetalles:\n${detalles}` : ''}`,
+        // Nada de attendees para evitar 403 por DWD
+        extendedProperties: { private: { cuidame: '1', range } },
+      };
 
-      const ev = await calendar.events.insert({
+      const ins = await calendar.events.insert({
         calendarId: cfg.calendarId,
-        sendUpdates: 'none', // <- clave para no intentar invitar
-        requestBody: {
-          start: { dateTime: start, timeZone: TZ },
-          end:   { dateTime: end,   timeZone: TZ },
-          summary,
-          description,
-          guestsCanInviteOthers: false,
-          guestsCanModify: false,
-          guestsCanSeeOtherGuests: false,
-          extendedProperties: { private: { cuidame: '1', range: r } },
-        },
-      });
-      created.push(ev.data.id);
-    }
-
-    res.json({ ok: true, created: created.length, eventIds: created, bloques: horas });
-  } catch (err) {
-    console.error('RESERVAR ERROR:', err);
-    res.status(500).json({ error: 'server_error', details: err.message });
-  }
-});
-
-// Cancelar (borra del calendario -> vuelve a quedar libre)
-app.post('/api/cancel', async (req, res) => {
-  try {
-    const { cuidadora, eventIds = [] } = req.body || {};
-    if (!cuidadora || eventIds.length === 0) return res.status(400).json({ error: 'missing_params' });
-
-    const cfg = CAREGIVERS[cuidadora];
-    if (!cfg) return res.status(404).json({ error: 'caregiver_not_found' });
-
-    const auth = getGoogleClient();
-    const calendar = google.calendar({ version: 'v3', auth });
-
-    for (const id of eventIds) {
-      await calendar.events.delete({
-        calendarId: cfg.calendarId,
-        eventId: id,
+        requestBody: event,
+        // Evitar envíos de invitaciones que causan 403 con service accounts
         sendUpdates: 'none',
       });
+
+      created.push(ins.data.id);
     }
-    res.json({ ok: true, deleted: eventIds.length });
+
+    res.json({
+      ok: true,
+      created: created.length,
+      bloques: horas,
+      precio: {
+        horas: horas.length,
+        subtotal: Number((horas.length * 18).toFixed(2)),
+        iva: Number((horas.length * 18 * 0.1).toFixed(2)),
+        total: Number((horas.length * 18 * 1.1).toFixed(2)),
+      },
+    });
   } catch (err) {
-    console.error('CANCEL ERROR:', err);
-    res.status(500).json({ error: 'server_error', details: err.message });
+    console.error('❌ RESERVAR ERROR:', err.response?.data || err.message);
+    res.status(500).json({ error: 'server_error' });
   }
 });
 
-app.listen(PORT, () => console.log(`API escuchando en ${PORT}`));
+/* ========= ARRANQUE ========= */
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`API escuchando en ${PORT}`);
+});
