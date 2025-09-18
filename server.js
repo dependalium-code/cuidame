@@ -5,11 +5,20 @@ import bodyParser from 'body-parser';
 import { google } from 'googleapis';
 import fs from 'fs';
 import nodemailer from 'nodemailer';
-import caregivers from './caregivers.json' with { type: 'json' }; // <-- Node 22
+import caregivers from './caregivers.json' with { type: 'json' }; // Node 22+
 
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
+
+// Desactivar caché en /api
+app.set('etag', false);
+app.use('/api', (_req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  next();
+});
 
 /* ========= ENV ========= */
 const PORT = process.env.PORT || 10000;
@@ -21,7 +30,7 @@ const LEAD_WORKDAYS = Number(process.env.LEAD_WORKDAYS || 0);
 const ORG_CALENDARS = (process.env.ORG_CALENDARS || '')
   .split(',')
   .map(s => s.trim())
-  .filter(Boolean); // otros calendarios donde también se crea la reserva
+  .filter(Boolean);
 
 /* ========= GOOGLE AUTH ========= */
 function getJwt() {
@@ -60,7 +69,12 @@ const pad = n => String(n).padStart(2, '0');
 const isWeekend = d => [0, 6].includes(d.getDay());
 const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
 function addWorkdays(d, n) { if (n <= 0) return d; let x = new Date(d), a = 0; while (a < n) { x = addDays(x, 1); if (!isWeekend(x)) a++; } return x; }
-function getRanges() { const out = []; for (let h = 9; h < 14; h++) out.push(`${pad(h)}:00-${pad(h+1)}:00`); for (let h = 16; h < 20; h++) out.push(`${pad(h)}:00-${pad(h+1)}:00`); return out; }
+function getRanges() {
+  const out = [];
+  for (let h = 9; h < 14; h++) out.push(`${pad(h)}:00-${pad(h+1)}:00`);
+  for (let h = 16; h < 20; h++) out.push(`${pad(h)}:00-${pad(h+1)}:00`);
+  return out;
+}
 
 const fmtHour = (date) =>
   new Intl.DateTimeFormat('es-ES', { hour: '2-digit', hour12: false, timeZone: TZ })
@@ -75,15 +89,14 @@ function parseDateFlexible(s) {
 function timeMinISO(ymdStr){ const d = parseDateFlexible(ymdStr); return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0,0,0)).toISOString(); }
 function timeMaxISO(ymdStr){ const d = parseDateFlexible(ymdStr); return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 23,59,59)).toISOString(); }
 
+/* === FIX 1: horas locales sin desfase === */
 function rangeToDateTimes(ymdStr, range) {
-  const d = parseDateFlexible(ymdStr);
-  const [s,e] = range.split('-');
-  const [sh] = s.split(':').map(Number);
-  const [eh] = e.split(':').map(Number);
-  const start = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), sh));
-  const end   = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), eh));
-  return { start: { dateTime: start.toISOString(), timeZone: TZ },
-           end:   { dateTime: end.toISOString(),   timeZone: TZ } };
+  const [s, e] = range.split('-');
+  const make = (hhmm) => {
+    const [h, m = 0] = hhmm.split(':').map(Number);
+    return { dateTime: `${ymdStr}T${pad(h)}:${pad(m)}:00`, timeZone: TZ };
+  };
+  return { start: make(s), end: make(e) };
 }
 
 const normalize = s => (s||'').toString().normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim().toLowerCase();
@@ -197,7 +210,12 @@ app.post('/api/reserve', async (req, res) => {
     const conflicts = horas.filter(r => occupied.has(r));
     if (conflicts.length) return res.status(409).json({ error:'conflicto', slots: conflicts });
 
-    const writeCalendars = Array.from(new Set([map.calendarId, ...ORG_CALENDARS]));
+    /* === FIX 2: no escribir en calendarios de otras cuidadoras === */
+    const caregiverCalendarIds = new Set(Object.values(caregivers).map(c => c.calendarId));
+    let writeCalendars = [map.calendarId, ...ORG_CALENDARS]
+      .filter(id => id === map.calendarId || !caregiverCalendarIds.has(id));
+    writeCalendars = Array.from(new Set(writeCalendars)); // dedup
+
     const created = [];
     const cal = calClient();
 
@@ -222,7 +240,7 @@ app.post('/api/reserve', async (req, res) => {
       }
     }
 
-    // Email de cortesía (si está configurado)
+    // Correo de cortesía (si está configurado)
     await sendMail({
       to: email,
       subject: `Reserva confirmada — ${fecha} — ${map._key}`,
