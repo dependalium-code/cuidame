@@ -89,12 +89,29 @@ function parseDateFlexible(s) {
 function timeMinISO(ymdStr){ const d = parseDateFlexible(ymdStr); return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0,0,0)).toISOString(); }
 function timeMaxISO(ymdStr){ const d = parseDateFlexible(ymdStr); return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 23,59,59)).toISOString(); }
 
-/* === FIX 1: horas locales sin desfase === */
+/* === FIX 1: horas exactas con offset RFC3339 (+01:00/+02:00) === */
 function rangeToDateTimes(ymdStr, range) {
+  // Calcula el offset real de Europe/Madrid para esa fecha (verano/invierno)
+  const offsetFor = (dateYmd) => {
+    const ref = new Date(`${dateYmd}T12:00:00Z`);
+    const parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: TZ,
+      timeZoneName: 'shortOffset'
+    }).formatToParts(ref);
+    const name = (parts.find(p => p.type === 'timeZoneName') || {}).value || 'GMT+00';
+    const m = name.match(/GMT([+-]\d{1,2})(?::?(\d{2}))?/);
+    const sign = m && m[1].startsWith('-') ? '-' : '+';
+    const hh = m ? String(Math.abs(parseInt(m[1], 10))).padStart(2, '0') : '00';
+    const mm = (m && m[2]) ? m[2] : '00';
+    return `${sign}${hh}:${mm}`;
+  };
+
+  const offset = offsetFor(ymdStr);
   const [s, e] = range.split('-');
   const make = (hhmm) => {
     const [h, m = 0] = hhmm.split(':').map(Number);
-    return { dateTime: `${ymdStr}T${pad(h)}:${pad(m)}:00`, timeZone: TZ };
+    // devolvemos dateTime con offset embebido y SIN timeZone
+    return { dateTime: `${ymdStr}T${pad(h)}:${pad(m)}:00${offset}` };
   };
   return { start: make(s), end: make(e) };
 }
@@ -173,7 +190,7 @@ app.get('/api/slots', async (req, res) => {
   }
 });
 
-// Crear reserva en 1) calendario de la cuidadora + 2) ORG_CALENDARS
+// Crear reserva en 1) calendario de la cuidadora + 2) ORG_CALENDARS (filtrados)
 app.post('/api/reserve', async (req, res) => {
   try {
     const { nombre, apellidos, email, telefono, localidad, direccion, servicios, cuidadora, fecha, horas = [], detalles = '' } = req.body || {};
@@ -266,3 +283,4 @@ app.post('/api/reserve', async (req, res) => {
 
 /* ========= START ========= */
 app.listen(PORT, () => console.log(`API escuchando en ${PORT}`));
+
