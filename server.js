@@ -5,8 +5,7 @@ import bodyParser from 'body-parser';
 import { google } from 'googleapis';
 import nodemailer from 'nodemailer';
 import fs from 'fs';
-import path from 'path';
-import caregivers from './caregivers.json' assert { type: 'json' };
+import caregiversRaw from './caregivers.json' assert { type: 'json' };
 
 const app = express();
 app.use(cors());
@@ -17,14 +16,13 @@ const PORT = process.env.PORT || 10000;
 const TZ = 'Europe/Madrid';
 const RATE = Number(process.env.RATE || 18);
 const IVA = Number(process.env.IVA || 0.10);
-const LEAD_WORKDAYS = Number(process.env.LEAD_WORKDAYS || 0); // 0 = sin restricción, >0 = días hábiles de colchón
+const LEAD_WORKDAYS = Number(process.env.LEAD_WORKDAYS || 0);
 
 /* ======= GOOGLE AUTH ======= */
 function getJwt() {
-  // Render: GOOGLE_APPLICATION_CREDENTIALS debe apuntar a /etc/secrets/gsa.json
   const keyFile = process.env.GOOGLE_APPLICATION_CREDENTIALS;
   if (!keyFile || !fs.existsSync(keyFile)) {
-    throw new Error('No key or keyFile set. Define GOOGLE_APPLICATION_CREDENTIALS con la ruta de tu gsa.json');
+    throw new Error('No keyFile. Define GOOGLE_APPLICATION_CREDENTIALS con la ruta a tu gsa.json');
   }
   return new google.auth.JWT({
     keyFile,
@@ -43,7 +41,7 @@ const mailer = process.env.MAIL_USER
       secure: String(process.env.MAIL_SECURE || 'true') === 'true',
       auth: {
         user: process.env.MAIL_USER,
-        pass: process.env.MAIL_PASS, // Gmail App Password
+        pass: process.env.MAIL_PASS,
       },
     })
   : null;
@@ -51,13 +49,8 @@ const mailer = process.env.MAIL_USER
 async function sendMail({ to, subject, text }) {
   if (!mailer) return;
   const from = process.env.MAIL_FROM || process.env.MAIL_USER;
-  const toInt = process.env.MAIL_TO_INT || process.env.MAIL_USER;
   try {
     await mailer.sendMail({ from, to, subject, text });
-    // copia interna
-    if (toInt && toInt !== to) {
-      await mailer.sendMail({ from, to: toInt, subject: `(Copia) ${subject}`, text });
-    }
   } catch (e) {
     console.error('MAIL ERROR:', e.message);
   }
@@ -65,7 +58,6 @@ async function sendMail({ to, subject, text }) {
 
 /* ======= UTIL ======= */
 const pad = (n) => String(n).padStart(2, '0');
-function ymd(d) { return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`; }
 function isWeekend(d) { const wd = d.getDay(); return wd === 0 || wd === 6; }
 function addDays(d, n) { const x = new Date(d); x.setDate(x.getDate() + n); return x; }
 function addWorkdays(d, n) {
@@ -74,75 +66,70 @@ function addWorkdays(d, n) {
   let added = 0;
   while (added < n) {
     x = addDays(x, 1);
-    const wd = x.getDay();
-    if (wd !== 0 && wd !== 6) added++;
+    if (!isWeekend(x)) added++;
   }
   return x;
 }
-
-/** Rangos que quieres disponibles (incluye 13–14 que pediste) */
 function getRanges() {
   const out = [];
   for (let h = 9; h < 14; h++) out.push(`${pad(h)}:00-${pad(h + 1)}:00`);
   for (let h = 16; h < 20; h++) out.push(`${pad(h)}:00-${pad(h + 1)}:00`);
   return out;
 }
-
-/** Convierte "2025-09-25", "12:00-13:00" a datetimes ISO TZ */
 function rangeToDateTimes(dateYmd, range) {
   const [s, e] = range.split('-');
-  const [sh, sm] = s.split(':').map(Number);
-  const [eh, em] = e.split(':').map(Number);
+  const [sh] = s.split(':').map(Number);
+  const [eh] = e.split(':').map(Number);
   const [Y, M, D] = dateYmd.split('-').map(Number);
-  const start = new Date(Date.UTC(Y, M - 1, D, sh - 2, sm || 0)); // offset crudo; Google respeta timeZone
-  const end = new Date(Date.UTC(Y, M - 1, D, eh - 2, em || 0));
+  const start = new Date(Date.UTC(Y, M - 1, D, sh - 2));
+  const end = new Date(Date.UTC(Y, M - 1, D, eh - 2));
   return {
     start: { dateTime: start.toISOString(), timeZone: TZ },
     end: { dateTime: end.toISOString(), timeZone: TZ },
   };
 }
 
+/* ======= NORMALIZACIÓN DE NOMBRES ======= */
+const normalize = (s) =>
+  (s || '').toString().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toLowerCase();
+const caregiversIndex = Object.fromEntries(
+  Object.entries(caregiversRaw).map(([k, v]) => [normalize(k), { ...v, _key: k }])
+);
+
 /* ======= SLOTS ======= */
 app.get('/api/slots', async (req, res) => {
   try {
     const { fecha, cuidadora } = req.query;
-    if (!fecha || !cuidadora) return res.status(400).json({ error: 'faltan parametros' });
+    if (!fecha || !cuidadora) return res.status(400).json({ error: 'faltan_parametros' });
 
-    // ventana: todo el año, pero bloquea fines y respeta colchón laboral si LEAD_WORKDAYS>0
+    const key = normalize(cuidadora);
+    const map = caregiversIndex[key];
+    if (!map) return res.status(400).json({ error: 'cuidadora_desconocida' });
+
     const qDate = new Date(`${fecha}T00:00:00`);
-    if (isNaN(qDate)) return res.status(400).json({ error: 'fecha inválida' });
+    if (isNaN(qDate)) return res.status(400).json({ error: 'fecha_invalida' });
     if (isWeekend(qDate)) return res.json({ slots: [] });
 
     const earliest = addWorkdays(new Date(), LEAD_WORKDAYS);
     earliest.setHours(0,0,0,0);
-    if (qDate < earliest) {
-      return res.json({ slots: [] });
-    }
-
-    const map = caregivers[cuidadora];
-    if (!map) return res.status(400).json({ error: 'cuidadora desconocida' });
+    if (qDate < earliest) return res.json({ slots: [] });
 
     const cal = calendarClient();
-
-    const timeMin = new Date(`${fecha}T00:00:00Z`).toISOString();
-    const timeMax = new Date(`${fecha}T23:59:59Z`).toISOString();
-
     const events = await cal.events.list({
       calendarId: map.calendarId,
-      timeMin,
-      timeMax,
+      timeMin: new Date(`${fecha}T00:00:00Z`).toISOString(),
+      timeMax: new Date(`${fecha}T23:59:59Z`).toISOString(),
       singleEvents: true,
       orderBy: 'startTime',
     });
 
-    // Toma todos los que se solapen (da igual quién los haya creado)
     const taken = new Set(
       (events.data.items || []).map((ev) => {
         try {
           const st = new Date(ev.start.dateTime || ev.start.date);
           const en = new Date(ev.end.dateTime || ev.end.date);
-          const sh = pad(st.getUTCHours()+2); // mostrar en horario local
-          const eh = pad(en.getUTCHours()+2);
+          const sh = pad(st.getUTCHours() + 2);
+          const eh = pad(en.getUTCHours() + 2);
           return `${sh}:00-${eh}:00`;
         } catch { return null; }
       }).filter(Boolean)
@@ -164,7 +151,8 @@ app.post('/api/reserve', async (req, res) => {
   }
 
   try {
-    const map = caregivers[cuidadora];
+    const key = normalize(cuidadora);
+    const map = caregiversIndex[key];
     if (!map) return res.status(400).json({ error: 'cuidadora_desconocida' });
 
     const qDate = new Date(`${fecha}T00:00:00`);
@@ -175,22 +163,20 @@ app.post('/api/reserve', async (req, res) => {
     if (qDate < earliest) return res.status(400).json({ error: 'antes_de_lead' });
 
     const cal = calendarClient();
-
-    // Comprobación de colisiones previa
-    const timeMin = new Date(`${fecha}T00:00:00Z`).toISOString();
-    const timeMax = new Date(`${fecha}T23:59:59Z`).toISOString();
-    const dayEv = await cal.events.list({
+    const existing = (await cal.events.list({
       calendarId: map.calendarId,
-      timeMin, timeMax, singleEvents: true, orderBy: 'startTime',
-    });
+      timeMin: new Date(`${fecha}T00:00:00Z`).toISOString(),
+      timeMax: new Date(`${fecha}T23:59:59Z`).toISOString(),
+      singleEvents: true,
+      orderBy: 'startTime',
+    })).data.items || [];
 
-    const existing = dayEv.data.items || [];
     const occupied = new Set(existing.map((ev) => {
       try {
         const st = new Date(ev.start.dateTime || ev.start.date);
         const en = new Date(ev.end.dateTime || ev.end.date);
-        const sh = pad(st.getUTCHours()+2);
-        const eh = pad(en.getUTCHours()+2);
+        const sh = pad(st.getUTCHours() + 2);
+        const eh = pad(en.getUTCHours() + 2);
         return `${sh}:00-${eh}:00`;
       } catch { return null; }
     }).filter(Boolean));
@@ -198,57 +184,26 @@ app.post('/api/reserve', async (req, res) => {
     const conflicts = horas.filter((r) => occupied.has(r));
     if (conflicts.length) return res.status(409).json({ error: 'conflicto', slots: conflicts });
 
-    // Crear eventos (sin attendees) - esto evita el 403
     const createdIds = [];
     for (const r of horas) {
       const { start, end } = rangeToDateTimes(fecha, r);
-      const summary = `CUIDAME — ${nombre} ${apellidos} — ${r}`;
-      const description =
-`Tel: ${telefono}
-Email: ${email}
-Localidad: ${localidad}
-Dirección: ${direccion}
-Servicios: ${Array.isArray(servicios) ? servicios.join(', ') : servicios}
-Cuidadora: ${cuidadora}
-Origen: web-hero-overlay
-${detalles ? `Detalles: ${detalles}` : ''}`;
-
+      const summary = `Reserva — ${nombre} ${apellidos} — ${r}`;
+      const description = `Tel: ${telefono}\nEmail: ${email}\nLocalidad: ${localidad}\nDirección: ${direccion}\nServicios: ${servicios.join(', ')}\nCuidadora: ${cuidadora}\n${detalles ? `Detalles: ${detalles}` : ''}`;
       const ev = await cal.events.insert({
         calendarId: map.calendarId,
-        sendUpdates: 'none', // ¡importante!
+        sendUpdates: 'none',
         requestBody: {
           start, end, summary, description,
-          extendedProperties: { private: { cuidame: '1', range: r } },
-          guestsCanInviteOthers: false,
-          guestsCanSeeOtherGuests: false,
+          extendedProperties: { private: { range: r } }
         },
       });
-
       createdIds.push(ev.data.id);
     }
 
-    // Email de confirmación (cliente + copia interna)
     await sendMail({
       to: email,
       subject: `Reserva confirmada — ${fecha} — ${cuidadora}`,
-      text:
-`Hola ${nombre},
-
-Hemos confirmado tu reserva con ${cuidadora} para el día ${fecha} en los bloques:
-${horas.map(h => `• ${h}`).join('\n')}
-
-Importe estimado:
-  - Horas: ${horas.length}
-  - Subtotal: ${(RATE*horas.length).toFixed(2)} €
-  - IVA (${(IVA*100)}%): ${(RATE*horas.length*IVA).toFixed(2)} €
-  - TOTAL: ${(RATE*horas.length*(1+IVA)).toFixed(2)} €
-
-Recuerda: el servicio debe abonarse 24 horas antes de comenzar para quedar reservado.
-Si necesitas ayuda, responde a este correo.
-
-Gracias,
-Equipo Cuidame
-`,
+      text: `Hola ${nombre}, tu reserva para ${fecha} en ${horas.join(', ')} ha sido confirmada.`
     });
 
     res.json({
@@ -264,7 +219,6 @@ Equipo Cuidame
     });
   } catch (e) {
     console.error('RESERVAR ERROR:', e);
-    // Si llegase un 403 aquí es porque se han reintroducido attendees o falta permiso de escritura.
     res.status(500).json({ error: 'server_error' });
   }
 });
@@ -272,6 +226,4 @@ Equipo Cuidame
 /* ======= HEALTH ======= */
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
-app.listen(PORT, () => {
-  console.log(`API escuchando en ${PORT}`);
-});
+app.listen(PORT, () => console.log(`API escuchando en ${PORT}`));
