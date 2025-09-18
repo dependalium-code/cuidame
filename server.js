@@ -1,393 +1,372 @@
-// server.js - CommonJS (no ESM). Asegúrate de que package.json NO tenga "type":"module"
+/**
+ * Cuidame — Backend de reservas (Google Calendar + Email opcional)
+ * Modo: CommonJS (compatible con Node en Render)
+ */
+
 const express = require('express');
 const cors = require('cors');
-const path = require('path');
-const fs = require('fs');
-const crypto = require('crypto');
+const bodyParser = require('body-parser');
 const { google } = require('googleapis');
 const nodemailer = require('nodemailer');
 
-// ========= CONFIG =========
-const PORT = process.env.PORT || 10000;
-const TZ = 'Europe/Madrid';
-const LEAD_WORKDAYS = Number(process.env.LEAD_WORKDAYS || 5); // Días laborables de antelación
-const RATE = Number(process.env.RATE || 18);
-const IVA = Number(process.env.IVA || 0.10);
-const CANCEL_SECRET = process.env.CANCEL_SECRET || 'change_me_please';
+/* ---------- Configuración vía ENV ---------- */
+const PORT         = process.env.PORT || 10000;
+const TIMEZONE     = 'Europe/Madrid';
+const RATE         = Number(process.env.RATE || 18);
+const IVA          = Number(process.env.IVA || 0.10);
+const LEAD_WORKDAYS = Number(process.env.LEAD_WORKDAYS || 5); // días laborables mínimos
 
-// Email (Nodemailer). Recomendado: Gmail + "App Password"
-const MAIL_HOST   = process.env.MAIL_HOST   || 'smtp.gmail.com';
-const MAIL_PORT   = Number(process.env.MAIL_PORT || 465);
-const MAIL_SECURE = process.env.MAIL_SECURE !== 'false'; // por defecto true
-const MAIL_USER   = process.env.MAIL_USER   || 'dependalium@gmail.com';
-const MAIL_PASS   = process.env.MAIL_PASS   || ''; // App password
-const MAIL_FROM   = process.env.MAIL_FROM   || `Cuidame <${MAIL_USER}>`;
-const MAIL_TO_INT = process.env.MAIL_TO_INT || 'dependalium@gmail.com';
+/* ---------- Mapeo de cuidadoras (IDs CORREGIDOS) ---------- */
+/* Usa EXACTAMENTE estos IDs que nos pasaste */
+const CAREGIVERS = {
+  Raquel: {
+    calendarId:
+      'fe9a8085d8db29f888a6382935c82e20f33d476347adfe6416582401d377454d@group.calendar.google.com',
+    email: 'dependalium@gmail.com', // para futuros usos (no se invita)
+  },
+  Carmen: {
+    calendarId:
+      '4562295563647999c8222fc750cf01803405063f186574ff7df5dfe2694a9c73@group.calendar.google.com',
+    email: 'dependalium@gmail.com',
+  },
+  Daniela: {
+    calendarId:
+      '84f168dd91cb85bbe4a97b2c88d4d174a3b09f53e025b0a51f401dc91cf70759@group.calendar.google.com',
+    email: 'dependalium@gmail.com',
+  },
+};
 
-// Carga cuidadores (IDs correctos)
-const caregivers = JSON.parse(
-  fs.readFileSync(path.join(__dirname, 'caregivers.json'), 'utf8')
-);
-// caregivers.json DEBE tener este formato:
-//
-// {
-//   "Raquel":  { "calendarId": "fe9a8085d8db29f888a6382935c82e20f33d476347adfe6416582401d377454d@group.calendar.google.com" },
-//   "Carmen":  { "calendarId": "4562295563647999c8222fc750cf01803405063f186574ff7df5dfe2694a9c73@group.calendar.google.com" },
-//   "Daniela": { "calendarId": "84f168dd91cb85bbe4a97b2c88d4d174a3b09f53e025b0a51f401dc91cf70759@group.calendar.google.com" }
-// }
+/* ---------- Slots de trabajo (incluye 13:00–14:00) ---------- */
+const SLOT_RANGES = [
+  '09:00-10:00',
+  '10:00-11:00',
+  '11:00-12:00',
+  '12:00-13:00',
+  '13:00-14:00',
+  // tarde
+  '17:00-18:00',
+  '18:00-19:00',
+  '19:00-20:00',
+];
 
-// ========= GOOGLE AUTH (Service Account) =========
-// Requiere GOOGLE_APPLICATION_CREDENTIALS=/etc/secrets/gsa.json (Render: Secret File + env var)
-const auth = new google.auth.JWT({
-  keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS,
+/* ---------- Utilidades de fecha ---------- */
+const isWeekend = (date) => {
+  const d = new Date(date);
+  const day = d.getUTCDay(); // 0 dom, 6 sáb (con cuidado si usas getDay/getUTCDay)
+  return day === 0 || day === 6;
+};
+
+// suma días naturales
+const addDays = (d, n) => {
+  const x = new Date(d);
+  x.setDate(x.getDate() + n);
+  return x;
+};
+
+// suma "días laborables"
+const addWorkdays = (startDate, workdays) => {
+  let d = new Date(startDate);
+  let added = 0;
+  while (added < workdays) {
+    d = addDays(d, 1);
+    const wd = d.getDay(); // local: 0 dom, 6 sáb
+    if (wd !== 0 && wd !== 6) added++;
+  }
+  return d;
+};
+
+const pad = (n) => String(n).padStart(2, '0');
+const fmtDate = (d) =>
+  `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+
+// Devuelve { startISO, endISO } en formato YYYY-MM-DDTHH:mm:ss (sin offset)
+// Google interpretará según el `timeZone` que le pasamos al crear el evento
+function buildSlotISO(fecha, range) {
+  const [h1, h2] = range.split('-');
+  const [H1, M1] = h1.split(':').map(Number);
+  const [H2, M2] = h2.split(':').map(Number);
+
+  // Construimos objetos Date en local para generar la parte 'HH:mm:ss'
+  const start = new Date(`${fecha}T${pad(H1)}:${pad(M1)}:00`);
+  const end   = new Date(`${fecha}T${pad(H2)}:${pad(M2)}:00`);
+
+  const iso = (d) =>
+    `${fecha}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  return { startISO: iso(start), endISO: iso(end) };
+}
+
+// Comprobación de solape entre dos rangos (en minutos)
+function overlap(rangeA, rangeB) {
+  const toMin = (hhmm) => {
+    const [h, m] = hhmm.split(':').map(Number);
+    return h * 60 + m;
+  };
+  const [a1, a2] = rangeA.split('-');
+  const [b1, b2] = rangeB.split('-');
+  const A1 = toMin(a1), A2 = toMin(a2);
+  const B1 = toMin(b1), B2 = toMin(b2);
+  return Math.max(A1, B1) < Math.min(A2, B2);
+}
+
+/* ---------- Google Calendar auth ---------- */
+const auth = new google.auth.GoogleAuth({
   scopes: ['https://www.googleapis.com/auth/calendar'],
+  // GOOGLE_APPLICATION_CREDENTIALS debe apuntar al /etc/secrets/gsa.json en Render
 });
 const calendar = google.calendar({ version: 'v3', auth });
 
-// ========= EMAIL (Nodemailer) =========
-const transporter = nodemailer.createTransport({
-  host: MAIL_HOST,
-  port: MAIL_PORT,
-  secure: MAIL_SECURE,
-  auth: { user: MAIL_USER, pass: MAIL_PASS },
-});
+/* ---------- Email (opcional) ---------- */
+const emailEnabled =
+  !!process.env.MAIL_HOST && !!process.env.MAIL_USER && !!process.env.MAIL_PASS;
 
-// ========= UTILS =========
-const pad = (n) => String(n).padStart(2, '0');
-const isWeekend = (d) => {
-  const wd = d.getDay();
-  return wd === 0 || wd === 6;
-};
-function addDays(date, n) {
-  const d = new Date(date);
-  d.setDate(d.getDate() + n);
-  return d;
-}
-function addWorkdays(date, n) {
-  const d = new Date(date);
-  let count = 0;
-  while (count < n) {
-    d.setDate(d.getDate() + 1);
-    if (!isWeekend(d)) count++;
-  }
-  return d;
-}
-function ymd(d) {
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+let mailer = null;
+if (emailEnabled) {
+  mailer = nodemailer.createTransport({
+    host: process.env.MAIL_HOST,
+    port: Number(process.env.MAIL_PORT || 465),
+    secure: String(process.env.MAIL_SECURE || 'true') === 'true',
+    auth: {
+      user: process.env.MAIL_USER,
+      pass: process.env.MAIL_PASS,
+    },
+  });
 }
 
-// Rango horario (incluye 13:00–14:00)
-function genRanges() {
-  const out = [];
-  for (let h = 9; h < 14; h++) out.push(`${pad(h)}:00-${pad(h + 1)}:00`);
-  for (let h = 16; h < 20; h++) out.push(`${pad(h)}:00-${pad(h + 1)}:00`);
-  return out;
-}
-
-// Convierte YYYY-MM-DD + "HH:MM-HH:MM" (local Madrid) a ISO
-function slotToISO(fecha, range) {
-  const [a, b] = range.split('-'); // "HH:MM", "HH:MM"
-  const [sh, sm] = a.split(':').map(Number);
-  const [eh, em] = b.split(':').map(Number);
-
-  // Construimos en zona local Europe/Madrid:
-  // Creamos fecha base en UTC y usamos offset fijo con Intl (suficiente para Calendar)
-  const d = new Date(`${fecha}T00:00:00`);
-  const start = new Date(d);
-  start.setHours(sh, sm, 0, 0);
-  const end = new Date(d);
-  end.setHours(eh, em, 0, 0);
-
-  return {
-    startISO: start.toISOString(),
-    endISO: end.toISOString(),
-  };
-}
-
-// Firma HMAC para cancelación
-function signCancel(caregiver, eventId) {
-  return crypto
-    .createHmac('sha256', CANCEL_SECRET)
-    .update(`${caregiver}:${eventId}`)
-    .digest('hex');
-}
-
-// ========= APP =========
+/* ---------- Servidor ---------- */
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(bodyParser.json());
 
-app.get('/api/health', (req, res) => res.json({ ok: true }));
+/* Salud */
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true, time: new Date().toISOString() });
+});
 
-// ========= SLOTS =========
+/* Obtener slots disponibles para una cuidadora/fecha */
 app.get('/api/slots', async (req, res) => {
   try {
-    const { fecha, cuidadora } = req.query;
-    if (!fecha || !cuidadora) {
-      return res.status(400).json({ error: 'missing_params' });
+    const cuidadora = String(req.query.cuidadora || '');
+    const fecha = String(req.query.fecha || '');
+
+    if (!CAREGIVERS[cuidadora]) {
+      return res.status(400).json({ error: 'cuidadora_invalida' });
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) {
+      return res.status(400).json({ error: 'fecha_invalida' });
     }
 
-    const c = caregivers[cuidadora];
-    if (!c?.calendarId) {
-      return res.status(400).json({ error: 'unknown_caregiver' });
+    // Fines de semana bloqueados
+    const dateObj = new Date(`${fecha}T00:00:00`);
+    const dow = dateObj.getDay();
+    if (dow === 0 || dow === 6) {
+      return res.json({ fecha, slots: SLOT_RANGES.map((r) => ({ range: r, taken: true })) });
     }
 
-    // Bloqueo de findes + lead de N días laborables
-    const target = new Date(`${fecha}T00:00:00`);
-    if (isWeekend(target)) {
-      return res.json({ slots: [] });
-    }
-    const minDate = addWorkdays(new Date(), LEAD_WORKDAYS);
-    if (target < new Date(ymd(minDate) + 'T00:00:00')) {
-      return res.json({ slots: [] });
+    // Antelación mínima (días laborables)
+    const min = addWorkdays(new Date(), LEAD_WORKDAYS);
+    if (new Date(`${fecha}T00:00:00`) < new Date(fmtDate(min) + 'T00:00:00')) {
+      return res.json({ fecha, lead: LEAD_WORKDAYS, slots: SLOT_RANGES.map((r) => ({ range: r, taken: true })) });
     }
 
-    const timeMin = new Date(`${fecha}T00:00:00.000Z`).toISOString();
-    const timeMax = new Date(`${fecha}T23:59:59.999Z`).toISOString();
+    // Traer eventos del día en ese calendario
+    const { calendarId } = CAREGIVERS[cuidadora];
+    const timeMin = `${fecha}T00:00:00.000Z`;
+    const timeMax = `${fecha}T23:59:59.999Z`;
 
-    const ev = await calendar.events.list({
-      calendarId: c.calendarId,
+    const resp = await calendar.events.list({
+      calendarId,
       timeMin,
       timeMax,
       singleEvents: true,
       orderBy: 'startTime',
     });
 
-    const taken = new Set();
-    for (const e of ev.data.items || []) {
-      const ex = e.extendedProperties?.private?.range;
-      if (ex) {
-        taken.add(ex);
-      } else {
-        // Si no tiene metadata, calculamos el range por solapamiento “a la hora”
-        const s = e.start?.dateTime || e.start?.date;
-        const en = e.end?.dateTime || e.end?.date;
-        if (s && en) {
-          const sd = new Date(s);
-          const ed = new Date(en);
-          const hours = genRanges();
-          for (const r of hours) {
-            const { startISO, endISO } = slotToISO(fecha, r);
-            const rs = new Date(startISO);
-            const re = new Date(endISO);
-            // Solapamiento básico
-            if (rs < ed && re > sd) taken.add(r);
-          }
-        }
-      }
-    }
+    const events = resp.data.items || [];
 
-    const slots = genRanges().map((r) => ({
-      range: r,
-      taken: taken.has(r),
-    }));
-    res.json({ slots });
+    // Marcamos ocupados si hay solape
+    const slots = SLOT_RANGES.map((range) => {
+      // Si el evento fue creado por nosotros, guardamos el range en extendedProperties.private.range
+      const taken = events.some((ev) => {
+        const p = (ev.extendedProperties && ev.extendedProperties.private) || {};
+        if (p.range) return overlap(p.range, range);
+
+        // fallback: calcular por horas
+        try {
+          const start = new Date(ev.start.dateTime || ev.start.date);
+          const end = new Date(ev.end.dateTime || ev.end.date);
+          const startHH = `${pad(start.getHours())}:${pad(start.getMinutes())}`;
+          const endHH   = `${pad(end.getHours())}:${pad(end.getMinutes())}`;
+          return overlap(`${startHH}-${endHH}`, range);
+        } catch {
+          return false;
+        }
+      });
+
+      return { range, taken };
+    });
+
+    return res.json({ fecha, slots });
   } catch (err) {
     console.error('SLOTS ERROR:', err?.message || err);
-    res.status(500).json({ error: 'server_error' });
+    return res.status(500).json({ error: 'server_error' });
   }
 });
 
-// ========= RESERVE =========
+/* Crear reserva */
 app.post('/api/reserve', async (req, res) => {
   try {
-    const p = req.body || {};
+    const payload = req.body || {};
     const required = [
-      'nombre',
-      'apellidos',
-      'email',
-      'telefono',
-      'localidad',
-      'direccion',
-      'servicios',
-      'cuidadora',
-      'fecha',
-      'horas',
+      'nombre', 'apellidos', 'email', 'telefono',
+      'localidad', 'direccion', 'servicios', 'cuidadora',
+      'fecha', 'horas'
     ];
+
     for (const k of required) {
       if (
-        typeof p[k] === 'undefined' ||
-        (Array.isArray(p[k]) && p[k].length === 0) ||
-        (typeof p[k] === 'string' && !p[k].trim())
+        payload[k] === undefined ||
+        payload[k] === null ||
+        (Array.isArray(payload[k]) && payload[k].length === 0) ||
+        (typeof payload[k] === 'string' && payload[k].trim() === '')
       ) {
-        return res.status(400).json({ error: 'missing_field', field: k });
+        return res.status(400).json({ error: 'campo_requerido', campo: k });
       }
     }
 
-    const c = caregivers[p.cuidadora];
-    if (!c?.calendarId) return res.status(400).json({ error: 'unknown_caregiver' });
-
-    // Lead + findes
-    const target = new Date(`${p.fecha}T00:00:00`);
-    if (isWeekend(target)) return res.status(400).json({ error: 'weekend_not_allowed' });
-    const minDate = addWorkdays(new Date(), LEAD_WORKDAYS);
-    if (target < new Date(ymd(minDate) + 'T00:00:00')) {
-      return res.status(400).json({ error: 'lead_days_not_met' });
+    if (!CAREGIVERS[payload.cuidadora]) {
+      return res.status(400).json({ error: 'cuidadora_invalida' });
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(payload.fecha)) {
+      return res.status(400).json({ error: 'fecha_invalida' });
     }
 
-    // Conflictos en el día
-    const timeMin = new Date(`${p.fecha}T00:00:00.000Z`).toISOString();
-    const timeMax = new Date(`${p.fecha}T23:59:59.999Z`).toISOString();
-    const ev = await calendar.events.list({
-      calendarId: c.calendarId,
+    // Bloqueo de findes
+    const dow = new Date(`${payload.fecha}T00:00:00`).getDay();
+    if (dow === 0 || dow === 6) {
+      return res.status(400).json({ error: 'solo_lunes_viernes' });
+    }
+
+    // Antelación mínima de días laborables
+    const min = addWorkdays(new Date(), LEAD_WORKDAYS);
+    if (new Date(`${payload.fecha}T00:00:00`) < new Date(fmtDate(min) + 'T00:00:00')) {
+      return res.status(400).json({ error: 'lead_minimo', dias: LEAD_WORKDAYS });
+    }
+
+    // Comprobar conflictos antes de crear
+    const { calendarId } = CAREGIVERS[payload.cuidadora];
+    const timeMin = `${payload.fecha}T00:00:00.000Z`;
+    const timeMax = `${payload.fecha}T23:59:59.999Z`;
+
+    const resp = await calendar.events.list({
+      calendarId,
       timeMin,
       timeMax,
       singleEvents: true,
       orderBy: 'startTime',
     });
 
-    const existing = ev.data.items || [];
+    const events = resp.data.items || [];
+
     const conflicts = [];
-    for (const slot of p.horas) {
-      const { startISO, endISO } = slotToISO(p.fecha, slot);
-      const rs = new Date(startISO);
-      const re = new Date(endISO);
+    for (const range of payload.horas) {
+      // si ya está tomado => conflicto
+      const taken = events.some((ev) => {
+        const p = (ev.extendedProperties && ev.extendedProperties.private) || {};
+        if (p.range) return overlap(p.range, range);
 
-      const clash = existing.some((e) => {
-        const s = e.start?.dateTime || e.start?.date;
-        const en = e.end?.dateTime || e.end?.date;
-        if (!s || !en) return false;
-        const sd = new Date(s);
-        const ed = new Date(en);
-        return rs < ed && re > sd;
+        try {
+          const start = new Date(ev.start.dateTime || ev.start.date);
+          const end = new Date(ev.end.dateTime || ev.end.date);
+          const startHH = `${pad(start.getHours())}:${pad(start.getMinutes())}`;
+          const endHH   = `${pad(end.getHours())}:${pad(end.getMinutes())}`;
+          return overlap(`${startHH}-${endHH}`, range);
+        } catch {
+          return false;
+        }
       });
-      if (clash) conflicts.push(slot);
+      if (taken) conflicts.push(range);
     }
+
     if (conflicts.length) {
-      return res.status(409).json({ error: 'conflict', slots: conflicts });
+      return res.status(409).json({ error: 'conflicto', slots: conflicts });
     }
 
-    // Crear eventos (SIN attendees) + metadata propia
-    const created = [];
-    for (const slot of p.horas) {
-      const { startISO, endISO } = slotToISO(p.fecha, slot);
-      const event = {
-        start: { dateTime: startISO, timeZone: TZ },
-        end: { dateTime: endISO, timeZone: TZ },
-        summary: `CUIDAME — ${p.nombre} ${p.apellidos} — ${slot}`,
-        description:
-          `Tel: ${p.telefono}\n` +
-          `Email: ${p.email}\n` +
-          `Localidad: ${p.localidad}\n` +
-          `Dirección: ${p.direccion}\n` +
-          `Servicios: ${Array.isArray(p.servicios) ? p.servicios.join(', ') : String(p.servicios)}\n` +
-          `Cuidadora: ${p.cuidadora}\n` +
-          `Origen: web-hero-overlay`,
-        extendedProperties: {
-          private: { cuidame: '1', range: slot },
+    // Crear eventos (SIN attendees ni sendUpdates para evitar 403)
+    const createdIds = [];
+    for (const range of payload.horas) {
+      const { startISO, endISO } = buildSlotISO(payload.fecha, range);
+
+      const ev = await calendar.events.insert({
+        calendarId,
+        requestBody: {
+          start: { dateTime: startISO, timeZone: TIMEZONE },
+          end:   { dateTime: endISO,   timeZone: TIMEZONE },
+          summary: `CUIDAME — ${payload.nombre} ${payload.apellidos} — ${range}`,
+          description:
+            `Tel: ${payload.telefono}\n` +
+            `Email: ${payload.email}\n` +
+            `Localidad: ${payload.localidad}\n` +
+            `Dirección: ${payload.direccion}\n` +
+            `Servicios: ${payload.servicios.join(', ')}\n` +
+            `Cuidadora: ${payload.cuidadora}\n` +
+            `Origen: web-hero-overlay`,
+          extendedProperties: {
+            private: { cuidame: '1', range }
+          },
         },
-      };
-
-      const { data } = await calendar.events.insert({
-        calendarId: c.calendarId,
-        requestBody: event,
-        // IMPORTANTÍSIMO: sin sendUpdates ni attendees → no 403
       });
 
-      created.push({
-        id: data.id,
-        range: slot,
-        cancel_url: `/api/cancel?c=${encodeURIComponent(p.cuidadora)}&id=${encodeURIComponent(
-          data.id
-        )}&t=${signCancel(p.cuidadora, data.id)}`,
-      });
+      createdIds.push(ev.data.id);
     }
 
-    // Email de confirmación al cliente
-    const horas = p.horas.length;
-    const subtotal = RATE * horas;
+    // Email opcional de confirmación
+    if (emailEnabled && mailer) {
+      try {
+        await mailer.sendMail({
+          from: process.env.MAIL_FROM || `"Cuidame" <${process.env.MAIL_USER}>`,
+          to: payload.email,
+          bcc: process.env.MAIL_TO_INT, // copia interna opcional
+          subject: `Reserva confirmada — ${payload.cuidadora} — ${payload.fecha} (${payload.horas.join(', ')})`,
+          text:
+`Hola ${payload.nombre},
+
+Tu reserva se ha confirmado para el ${payload.fecha} en los tramos ${payload.horas.join(', ')} con ${payload.cuidadora}.
+Recuerda que el importe debe abonarse 24 horas antes de comenzar el servicio.
+
+Detalles:
+- Servicios: ${payload.servicios.join(', ')}
+- Dirección: ${payload.direccion}, ${payload.localidad}
+- Teléfono de contacto: ${payload.telefono}
+
+Gracias,
+Cuidame`,
+        });
+      } catch (mailErr) {
+        console.warn('EMAIL ERROR:', mailErr?.message || mailErr);
+      }
+    }
+
+    // Resumen de precio
+    const horasCount = payload.horas.length;
+    const subtotal = horasCount * RATE;
     const iva = subtotal * IVA;
     const total = subtotal + iva;
 
-    const prettyDate = p.fecha.split('-').reverse().join('/');
-
-    const mensajeCliente = [
-      `Hola ${p.nombre},`,
-      ``,
-      `Tu reserva con Cuidame está CONFIRMADA ✅`,
-      ``,
-      `• Fecha: ${prettyDate}`,
-      `• Cuidadora: ${p.cuidadora}`,
-      `• Horas: ${p.horas.join(', ')}`,
-      `• Servicios: ${Array.isArray(p.servicios) ? p.servicios.join(', ') : String(p.servicios)}`,
-      ``,
-      `Precio: ${RATE} €/h`,
-      `Subtotal: ${subtotal.toFixed(2)} €`,
-      `IVA (10%): ${iva.toFixed(2)} €`,
-      `TOTAL: ${total.toFixed(2)} €`,
-      ``,
-      `🔔 Recuerda: el importe de la reserva debe abonarse **24 horas antes** de empezar el servicio.`,
-      ``,
-      `Si necesitas anular algún tramo, responde a este correo y te ayudamos.`,
-      ``,
-      `Gracias por confiar en Cuidame.`,
-    ].join('\n');
-
-    // Cliente
-    if (MAIL_PASS) {
-      await transporter.sendMail({
-        from: MAIL_FROM,
-        to: p.email,
-        subject: `Reserva confirmada — ${prettyDate} — ${p.cuidadora}`,
-        text: mensajeCliente,
-      });
-
-      // Interno
-      await transporter.sendMail({
-        from: MAIL_FROM,
-        to: MAIL_TO_INT,
-        subject: `Nueva reserva — ${p.cuidadora} — ${prettyDate}`,
-        text:
-          `Nombre: ${p.nombre} ${p.apellidos}\n` +
-          `Teléfono: ${p.telefono}\nEmail: ${p.email}\n` +
-          `Localidad: ${p.localidad}\nDirección: ${p.direccion}\n` +
-          `Servicios: ${Array.isArray(p.servicios) ? p.servicios.join(', ') : String(p.servicios)}\n` +
-          `Cuidadora: ${p.cuidadora}\nFecha: ${prettyDate}\n` +
-          `Horas: ${p.horas.join(', ')}\n` +
-          `Total: ${total.toFixed(2)} €\n`,
-      });
-    } else {
-      console.warn('[EMAIL] MAIL_PASS no definido: no se envían emails.');
-    }
-
-    res.json({
+    return res.json({
       ok: true,
-      bloques: p.horas,
-      created: created.length,
-      precio: { horas, subtotal, iva, total },
-      cancel: created,
+      created: createdIds.length,
+      bloques: payload.horas,
+      precio: { horas: horasCount, subtotal, iva, total },
     });
   } catch (err) {
-    console.error('RESERVAR ERROR:', err);
-    const status = err?.code === 403 ? 403 : 500;
-    res.status(status).json({ error: 'server_error' });
+    console.error('RESERVAR ERROR:', err?.message || err);
+    // si viene de Google con detalles:
+    if (err?.response?.data) console.error('Google API:', err.response.data);
+    return res.status(500).json({ error: 'server_error' });
   }
 });
 
-// ========= CANCEL =========
-app.get('/api/cancel', async (req, res) => {
-  try {
-    const { c: caregiverName, id, t } = req.query;
-    if (!caregiverName || !id || !t) return res.status(400).send('Bad request');
-
-    const expected = signCancel(caregiverName, id);
-    if (t !== expected) return res.status(403).send('Forbidden');
-
-    const c = caregivers[caregiverName];
-    if (!c?.calendarId) return res.status(400).send('Unknown caregiver');
-
-    await calendar.events.delete({
-      calendarId: c.calendarId,
-      eventId: id,
-    });
-
-    res.send('Reserva cancelada y franja liberada.');
-  } catch (err) {
-    console.error('CANCEL ERROR:', err);
-    res.status(500).send('Server error');
-  }
-});
-
+/* Arrancar servidor */
 app.listen(PORT, () => {
   console.log(`API escuchando en ${PORT}`);
 });
